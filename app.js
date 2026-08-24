@@ -2,7 +2,7 @@
    Offline-first. The Sheet is the truth; the phone always holds a copy.
    Writes go to a queue on the phone and leave when there is signal. */
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const TABS = ['subjects','obligations','payments','activities','events',
               'documents','readings','contacts','vocab'];
 
@@ -512,6 +512,13 @@ function viewMoney(){
 
   h += eyebrow('Where it goes', undefined, 'per month') +
        `<div class="card">${bars(group(o => o.category))}</div>`;
+
+  const owners = group(o => o.owner);
+  if(owners.length > 1){
+    h += eyebrow('Who pays it', undefined, 'per month') +
+         `<div class="card">${bars(owners)}</div>`;
+  }
+
   h += eyebrow('What it is for') +
        `<div class="card">${bars(group(o => o.subject_id, id => nameOf(id) || 'Unassigned'))}</div>`;
 
@@ -721,6 +728,23 @@ const select = (label, name, value, options, allowBlank = true) =>
 
 const subjectOptions = () => S.subjects.map(s => ({v:s.id, t:s.name}));
 
+/* A dropdown backed by the vocab tab, with an "add a new one" escape hatch.
+   Anything added here is written to vocab, so it appears for both of you
+   from then on and reports never fracture into near-duplicates. */
+function vocabSelect(label, name, value, listName){
+  const opts = vocabList(listName);
+  const known = opts.some(o => o === value);
+  return `<label for="f_${name}">${label}</label>
+    <select id="f_${name}" name="${name}" data-vocab="${listName}">
+      <option value=""></option>
+      ${opts.map(o => `<option value="${esc(o)}" ${o === value ? 'selected' : ''}>${esc(o)}</option>`).join('')}
+      ${value && !known ? `<option value="${esc(value)}" selected>${esc(value)}</option>` : ''}
+      <option value="__new__">+ Add a new one…</option>
+    </select>
+    <input id="f_${name}_new" class="hide newvocab" type="text"
+           placeholder="Name it, then Save" autocomplete="off">`;
+}
+
 const FORMS = {
   obligation: {
     tab:'obligations', title:'Date or payment',
@@ -738,7 +762,9 @@ const FORMS = {
         <div>${field('Next due', 'next_due', r.next_due, 'date')}</div>
         <div>${field('Warn me (days before)', 'notice_days', r.notice_days ?? 14, 'number', 'inputmode="numeric"')}</div>
       </div>
-      ${select('Category', 'category', r.category, vocabList('category'))}
+      ${vocabSelect('Category', 'category', r.category, 'category')}
+      ${select('Paid from whose account', 'owner', r.owner,
+        [{v:'Abhishek',t:'Abhishek'},{v:'Deepika',t:'Deepika'},{v:'Joint',t:'Joint'}])}
       ${select('Which calendar', 'calendar', r.calendar || 'household',
         [{v:'household',t:'Household — just the two of you'},
          {v:'family',t:'Family — everyone sees it'},
@@ -756,7 +782,7 @@ const FORMS = {
         <div>${field('Time', 'start_time', r.start_time, 'time')}</div>
       </div>
       ${field('Where', 'venue', r.venue)}
-      ${select('Category', 'category', r.category, vocabList('event_category'))}
+      ${vocabSelect('Category', 'category', r.category, 'event_category')}
       ${select('Which calendar', 'calendar', r.calendar || 'family',
         [{v:'family',t:'Family — everyone sees it'},{v:'household',t:'Household — just the two of you'}], false)}
       ${field('Note', 'note', r.note)}`
@@ -804,7 +830,7 @@ const FORMS = {
     sub:'Blood tests, school grades, anything you want to see a trend in.',
     body: r => `
       ${select('Whose', 'subject_id', r.subject_id, subjectOptions())}
-      ${select('Kind', 'kind', r.kind, vocabList('reading_kind'))}
+      ${vocabSelect('Kind', 'kind', r.kind, 'reading_kind')}
       ${field('What was measured', 'label', r.label, 'text', 'placeholder="Haemoglobin"')}
       <div class="grid2">
         <div>${field('Value', 'value', r.value)}</div>
@@ -818,6 +844,30 @@ const FORMS = {
       ${field('Note', 'note', r.note)}`
   }
 };
+
+/* Reads a form, resolving any dropdown set to "add a new one" into the typed
+   value, and returns the new vocabulary entries that need creating. */
+function readForm(){
+  const out = {}, fresh = [];
+  document.querySelectorAll('#form [name]').forEach(i => out[i.name] = i.value);
+  document.querySelectorAll('#form select[data-vocab]').forEach(sel => {
+    if(sel.value !== '__new__') return;
+    const box = document.querySelector('#f_' + sel.name + '_new');
+    const typed = box ? box.value.trim() : '';
+    out[sel.name] = typed;
+    if(typed) fresh.push({list: sel.dataset.vocab, value: typed});
+  });
+  return {values: out, fresh};
+}
+
+async function saveNewVocab(fresh){
+  for(const f of fresh){
+    const already = S.vocab.some(v => v.list === f.list &&
+      String(v.value).toLowerCase() === f.value.toLowerCase());
+    if(!already) await save('vocab', {list: f.list, value: f.value,
+                                      sort: 900, active: 'yes'});
+  }
+}
 
 function formSheet(type, row = {}, intro = ''){
   const f = FORMS[type];
@@ -833,9 +883,10 @@ function formSheet(type, row = {}, intro = ''){
     </div>`);
 
   $('#saveBtn').onclick = async () => {
-    const out = {...row};
-    document.querySelectorAll('#form [name]').forEach(i => out[i.name] = i.value);
+    const {values, fresh} = readForm();
+    const out = {...row, ...values};
     if(!out.title && !out.name && !out.label) return toast('Give it a name at least.');
+    await saveNewVocab(fresh);
     await save(f.tab, out);
     closeSheet(); render();
     toast(navigator.onLine ? 'Saved' : 'Saved on the phone — will sync');
@@ -846,6 +897,16 @@ function formSheet(type, row = {}, intro = ''){
     closeSheet(); render(); toast('Deleted');
   };
 }
+
+/* reveal the "name it" box when a dropdown is set to add a new value */
+document.addEventListener('change', e => {
+  const sel = e.target.closest('select[data-vocab]');
+  if(!sel) return;
+  const box = document.querySelector('#f_' + sel.name + '_new');
+  if(!box) return;
+  box.classList.toggle('hide', sel.value !== '__new__');
+  if(sel.value === '__new__') box.focus();
+});
 
 /* --- detail sheet with mark-paid --- */
 
@@ -895,7 +956,7 @@ function markPaidSheet(o){
     <div id="form">
       ${field('Paid on', 'paid_on', today(), 'date')}
       ${field('Amount £', 'amount', o.amount, 'number', 'step="0.01" inputmode="decimal"')}
-      ${select('How', 'method', 'Direct debit', vocabList('method'))}
+      ${vocabSelect('How', 'method', 'Direct debit', 'method')}
       ${field('Note', 'note', '')}
     </div>
     <div class="btnrow">
@@ -903,8 +964,8 @@ function markPaidSheet(o){
       <button class="btn ghost" data-close="1">Cancel</button>
     </div>`);
   $('#confirm').onclick = async () => {
-    const v = {};
-    document.querySelectorAll('#form [name]').forEach(i => v[i.name] = i.value);
+    const {values: v, fresh} = readForm();
+    await saveNewVocab(fresh);
     // optimistic: write the payment locally and advance the date on the phone too
     await save('payments', { obligation_id:o.id, subject_id:o.subject_id,
       paid_on:v.paid_on, amount:v.amount, category:o.category,
@@ -926,7 +987,7 @@ function documentSheet(subjectId = ''){
     <div id="form">
       ${field('What is it', 'title', '')}
       ${select('What it is about', 'subject_id', subjectId, subjectOptions())}
-      ${select('Category', 'category', '', vocabList('doc_category'))}
+      ${vocabSelect('Category', 'category', '', 'doc_category')}
       <div class="grid2">
         <div>${field('Dated', 'doc_date', today(), 'date')}</div>
         <div>${field('Expires', 'expires_on', '', 'date')}</div>
@@ -950,8 +1011,8 @@ function documentSheet(subjectId = ''){
         r.onerror = () => rej(new Error('Could not read that file.'));
         r.readAsDataURL(f);
       });
-      const v = {};
-      document.querySelectorAll('#form [name]').forEach(i => v[i.name] = i.value);
+      const {values: v, fresh} = readForm();
+      await saveNewVocab(fresh);
       await call('upload', { ...v, name: f.name, mime: f.type, data });
       closeSheet(); toast('Uploaded and read'); sync();
     }catch(e){
