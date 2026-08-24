@@ -152,6 +152,57 @@ nav button[aria-current="true"]{color:var(--biro)}
   font-size:29px;line-height:1;box-shadow:0 5px 18px rgba(42,76,143,.36);cursor:pointer}
 @media(max-width:652px){.fab{right:var(--pad)}}
 
+/* ---- calendar ---- */
+.segbar{display:flex;gap:4px;margin:18px 0 4px;background:var(--hair);
+  border-radius:10px;padding:3px}
+.seg{flex:1;font-family:inherit;font-size:11px;font-weight:700;letter-spacing:.12em;
+  text-transform:uppercase;border:0;background:none;color:var(--ink-2);
+  padding:8px 4px;border-radius:8px;cursor:pointer}
+.seg.on{background:var(--card);color:var(--biro);box-shadow:var(--shadow)}
+.calnav{display:flex;align-items:center;justify-content:space-between;margin-top:10px}
+.caltitle{font-size:15px;font-weight:700;letter-spacing:.02em}
+.calnav .btn{font-size:22px;line-height:1;padding:6px 14px}
+.calhead{display:grid;grid-template-columns:repeat(7,1fr);margin-top:6px;
+  padding-bottom:5px;border-bottom:1px solid var(--rule)}
+.calhead span{text-align:center;font-size:10px;font-weight:700;letter-spacing:.1em;
+  color:var(--ink-2)}
+.cal{display:grid;grid-template-columns:repeat(7,1fr)}
+.cell{aspect-ratio:1/1;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:3px;background:none;border:0;
+  border-bottom:1px solid var(--hair);border-right:1px solid var(--hair);
+  font-family:inherit;color:inherit;cursor:pointer;padding:0}
+.cell:nth-child(7n){border-right:0}
+.cell b{font-size:14.5px;font-weight:500;line-height:1}
+.cell.out b{color:var(--ink-2);opacity:.45}
+.cell.today b{color:var(--biro);font-weight:800}
+.cell.today{background:rgba(42,76,143,.07)}
+.cell.sel{outline:2px solid var(--biro);outline-offset:-2px;border-radius:8px}
+.dots{display:flex;gap:2.5px;height:5px;align-items:center}
+.dots i{width:5px;height:5px;border-radius:50%;display:block}
+.d-obligation,.d-notice{background:var(--biro)}
+.d-notice{opacity:.45}
+.d-event{background:var(--amber)}
+.d-activity{background:var(--green)}
+.d-document{background:var(--ink-2)}
+.d-late{background:var(--red)}
+
+.wk{display:grid;grid-template-columns:48px 1fr;gap:12px;padding:11px 0;
+  border-bottom:1px solid var(--hair);align-items:start}
+.wk.now .wkday b{color:var(--biro);font-weight:800}
+.wkday{text-align:right;padding-right:12px;border-right:1px solid var(--rule)}
+.wkday b{font-size:19px;font-weight:600;display:block;line-height:1.1}
+.wkday s{text-decoration:none;font-size:10px;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--ink-2)}
+.wkitems{display:flex;flex-direction:column;gap:5px;min-height:30px;padding-top:2px}
+.wkfree{color:var(--ink-2);font-size:14px}
+.pill{text-align:left;font-family:inherit;font-size:13.5px;font-weight:500;
+  border:0;border-left:3px solid var(--biro);background:var(--hair);
+  color:var(--ink);padding:7px 10px;border-radius:0 8px 8px 0;cursor:pointer}
+.p-event{border-left-color:var(--amber)}
+.p-activity{border-left-color:var(--green)}
+.p-notice{border-left-color:var(--biro);opacity:.72}
+.p-document{border-left-color:var(--ink-2)}
+
 .empty{color:var(--ink-2);font-size:14.5px;padding:20px 0 6px;line-height:1.55}
 .empty b{display:block;color:var(--ink);font-size:15.5px;margin-bottom:3px}
 .toast{position:fixed;left:50%;transform:translateX(-50%);
@@ -168,7 +219,7 @@ nav button[aria-current="true"]{color:var(--biro)}
 <header>
   <div class="hbar">
     <h1 class="brand">Hearth</h1>
-    <span class="ver num" id="ver">v0.1.0</span>
+    <span class="ver num" id="ver">v0.2.0</span>
     <button class="sync" id="syncBtn" type="button">
       <span class="dot off" id="dot"></span><span id="syncTxt">Not set up</span>
     </button>
@@ -195,6 +246,6 @@ nav button[aria-current="true"]{color:var(--biro)}
 
 <div class="toast" id="toast"></div>
 
-<script src="app.js?v=0.1.0"></script>
+<script src="app.js?v=0.2.0"></script>
 </body>
 </html>

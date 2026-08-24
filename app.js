@@ -2,7 +2,7 @@
    Offline-first. The Sheet is the truth; the phone always holds a copy.
    Writes go to a queue on the phone and leave when there is signal. */
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const TABS = ['subjects','obligations','payments','activities','events',
               'documents','readings','contacts','vocab'];
 
@@ -198,6 +198,9 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
 
 let screen = 'today';
 let subjectOpen = null;
+let datesView = 'month';
+let datesAnchor = null;      // set on first render, once today() is available
+let daySelected = null;
 
 function setStatus(kind, text){
   $('#dot').className = 'dot ' + ({ok:'',busy:'busy',err:'err',off:'off'}[kind] ?? 'off');
@@ -243,6 +246,7 @@ const eyebrow = (label, count, right) =>
 
 function render(){
   if(!cfg.ready) return renderSetup();
+  if(!datesAnchor) datesAnchor = today();
   const el = $('#screen');
   if(subjectOpen) el.innerHTML = viewSubject(subjectOpen);
   else if(screen === 'today')  el.innerHTML = viewToday();
@@ -335,9 +339,137 @@ function viewToday(){
   return h;
 }
 
+/* --- everything happening on one day, including the weekly classes --- */
+function itemsOn(dateStr){
+  const out = [];
+  const dow = DAYS[parse(dateStr).getDay()];
+
+  liveObligations().forEach(o => {
+    if(o.next_due === dateStr)
+      out.push({kind:'obligation', id:o.id, title:o.title + ' due',
+                sub:[o.provider, nameOf(o.subject_id)].filter(Boolean).join(' · '),
+                amount:o.amount});
+    const n = parseInt(o.notice_days || 0, 10);
+    if(n > 0 && o.next_due){
+      const nd = parse(o.next_due); nd.setDate(nd.getDate() - n);
+      if(iso(nd) === dateStr)
+        out.push({kind:'notice', id:o.id, title:o.title + ' in ' + n + ' days',
+                  sub:[o.provider, 'heads-up'].filter(Boolean).join(' · ')});
+    }
+  });
+  S.events.forEach(e => { if(e.on_date === dateStr)
+    out.push({kind:'event', id:e.id, title:e.title,
+              sub:[e.start_time, e.venue, nameOf(e.subject_id)].filter(Boolean).join(' · ')}); });
+  S.activities.forEach(a => {
+    if(String(a.day_of_week).toLowerCase() !== dow) return;
+    if(a.term_start && a.term_start > dateStr) return;
+    if(a.term_end && a.term_end < dateStr) return;
+    out.push({kind:'activity', id:a.id, title:a.title,
+              sub:[a.start_time, nameOf(a.subject_id), a.venue].filter(Boolean).join(' · ')});
+  });
+  S.documents.forEach(d => { if(d.expires_on === dateStr)
+    out.push({kind:'document', id:d.id, title:d.title + ' expires',
+              sub:nameOf(d.subject_id)}); });
+
+  return out;
+}
+
+const KIND_ORDER = {notice:0, obligation:1, event:2, activity:3, document:4};
+const dayItems = d => itemsOn(d).sort((a,b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind]);
+
+function shiftMonth(anchor, by){
+  const d = parse(anchor);
+  const n = new Date(d.getFullYear(), d.getMonth() + by, 1);
+  return iso(n);
+}
+function startOfWeek(anchor){
+  const d = parse(anchor);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));   // Monday first
+  return iso(d);
+}
+
 function viewDates(){
+  const seg = ['month','week','list'].map(v =>
+    `<button class="seg${datesView === v ? ' on' : ''}" data-datesview="${v}">${v}</button>`).join('');
+  let h = `<div class="segbar">${seg}</div>`;
+  if(datesView === 'month') h += monthView();
+  else if(datesView === 'week') h += weekView();
+  else h += listView();
+  return h;
+}
+
+function monthView(){
+  const a = parse(datesAnchor);
+  const first = new Date(a.getFullYear(), a.getMonth(), 1);
+  const start = parse(iso(first));
+  start.setDate(1 - ((first.getDay() + 6) % 7));
+
+  let cells = '';
+  for(let i = 0; i < 42; i++){
+    const d = new Date(start.getTime()); d.setDate(start.getDate() + i);
+    const ds = iso(d);
+    const items = dayItems(ds);
+    const out = d.getMonth() !== a.getMonth();
+    const isToday = ds === today();
+    const overdue = items.some(x => x.kind === 'obligation' && ds < today());
+    const dots = items.slice(0,4).map(x =>
+      `<i class="d-${overdue && x.kind === 'obligation' ? 'late' : x.kind}"></i>`).join('');
+    cells += `<button class="cell${out?' out':''}${isToday?' today':''}${ds===daySelected?' sel':''}"
+      data-day="${ds}"><b class="num">${d.getDate()}</b><span class="dots">${dots}</span></button>`;
+  }
+
+  const sel = daySelected || today();
+  const list = dayItems(sel);
+
+  return `
+  <div class="calnav">
+    <button class="btn ghost" data-month="-1" aria-label="Previous month">‹</button>
+    <span class="caltitle">${MON[a.getMonth()]} ${a.getFullYear()}</span>
+    <button class="btn ghost" data-month="1" aria-label="Next month">›</button>
+  </div>
+  <div class="calhead"><span>M</span><span>T</span><span>W</span><span>T</span><span>F</span><span>S</span><span>S</span></div>
+  <div class="cal">${cells}</div>
+  ${eyebrow(pretty(sel), list.length)}
+  ${list.length ? list.map(i => rowHTML(
+      {b: i.kind === 'activity' ? '◷' : i.kind === 'event' ? '◆' : i.kind === 'notice' ? '◇' : '£',
+       s: i.kind, cls: i.kind === 'obligation' && sel < today() ? 'past' : ''},
+      i.title, i.sub, i.amount ? money(+i.amount) : '',
+      `data-open="${i.kind}:${i.id}"`)).join('')
+    : '<div class="empty">Nothing on this day.</div>'}`;
+}
+
+function weekView(){
+  const start = parse(startOfWeek(datesAnchor));
+  let h = `<div class="calnav">
+    <button class="btn ghost" data-week="-1" aria-label="Previous week">‹</button>
+    <span class="caltitle">Week of ${pretty(iso(start))}</span>
+    <button class="btn ghost" data-week="1" aria-label="Next week">›</button>
+  </div>`;
+
+  for(let i = 0; i < 7; i++){
+    const d = new Date(start.getTime()); d.setDate(start.getDate() + i);
+    const ds = iso(d);
+    const items = dayItems(ds);
+    const isToday = ds === today();
+    h += `<div class="wk${isToday ? ' now' : ''}">
+      <div class="wkday">
+        <b class="num">${d.getDate()}</b>
+        <s>${DAYS[d.getDay()].slice(0,3)}</s>
+      </div>
+      <div class="wkitems">${
+        items.length ? items.map(i =>
+          `<button class="pill p-${i.kind}" data-open="${i.kind}:${i.id}">
+             ${esc(i.title)}${i.amount ? ' · ' + money(+i.amount) : ''}
+           </button>`).join('')
+        : '<span class="wkfree">—</span>'}</div>
+    </div>`;
+  }
+  return h;
+}
+
+function listView(){
   const up = upcoming().filter(i => daysTo(i.date) >= -365);
-  if(!up.length) return '<div class="empty" style="padding-top:40px"><b>No dates yet.</b>Add anything with a renewal or a deadline and it appears here, and on the calendar.</div>';
+  if(!up.length) return '<div class="empty" style="padding-top:30px"><b>No dates yet.</b>Add anything with a renewal or a deadline and it appears here, and on the calendar.</div>';
   let h = '', month = '';
   up.forEach(i => {
     const d = parse(i.date);
@@ -860,8 +992,16 @@ function settingsSheet(){
 /* ------------------------------------------------------------ events */
 
 document.addEventListener('click', async e => {
-  const t = e.target.closest('[data-close],[data-open],[data-subject],[data-back],[data-new],[data-settings],[data-doc],[data-tel]');
+  const t = e.target.closest('[data-close],[data-open],[data-subject],[data-back],[data-new],[data-settings],[data-doc],[data-tel],[data-datesview],[data-month],[data-week],[data-day]');
   if(!t) return;
+
+  if(t.dataset.datesview){ datesView = t.dataset.datesview; return render(); }
+  if(t.dataset.month){ datesAnchor = shiftMonth(datesAnchor, +t.dataset.month);
+    daySelected = null; return render(); }
+  if(t.dataset.week){
+    const d = parse(datesAnchor); d.setDate(d.getDate() + 7 * +t.dataset.week);
+    datesAnchor = iso(d); return render(); }
+  if(t.dataset.day){ daySelected = t.dataset.day; return render(); }
 
   if(t.dataset.close) return closeSheet();
   if(t.dataset.back){ subjectOpen = null; return render(); }
