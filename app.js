@@ -2,9 +2,9 @@
    Offline-first. The Sheet is the truth; the phone always holds a copy.
    Writes go to a queue on the phone and leave when there is signal. */
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const TABS = ['subjects','obligations','payments','activities','events',
-              'documents','readings','contacts','vocab'];
+              'documents','readings','contacts','tasks','vocab'];
 
 /* ------------------------------------------------------------ settings */
 
@@ -190,6 +190,80 @@ const nameOf = id => (subjectOf(id) || {}).name || '';
 const vocabList = list => S.vocab.filter(v => v.list === list && v.active !== 'no')
   .sort((a,b) => (+a.sort||0) - (+b.sort||0)).map(v => v.value);
 
+/* ------------------------------------------------------------ tasks */
+
+const WORD_DAY = {sunday:0, monday:1, tuesday:2, wednesday:3,
+                  thursday:4, friday:5, saturday:6};
+
+/**
+ * A small offline parser for the quick-add box, so typing "gym at 10" or
+ * "call the agent tomorrow" sets a time without needing the network.
+ * Deliberately conservative: if it isn't sure, it leaves the date alone
+ * and you still get the task.
+ */
+function quickParse(raw){
+  let text = ' ' + raw.trim() + ' ';
+  const out = {title: raw.trim()};
+
+  const time = /\s(?:at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?|(\d{1,2})(?::(\d{2}))?\s*(am|pm))\s/i.exec(text);
+  if(time){
+    let h = parseInt(time[1] ?? time[4], 10);
+    const min = time[2] ?? time[5] ?? '00';
+    const ap = (time[3] ?? time[6] ?? '').toLowerCase();
+    if(ap === 'pm' && h < 12) h += 12;
+    if(ap === 'am' && h === 12) h = 0;
+    // a bare "at 1" in a day's plan almost always means the afternoon
+    if(!ap && h >= 1 && h <= 6) h += 12;
+    if(h >= 0 && h <= 23){
+      out.due_time = ('0'+h).slice(-2) + ':' + min;
+      out.due_date = today();
+      out.remind = 'yes';
+      // only tidy the time away when it trails the sentence, so
+      // "check when her lesson is at 4" keeps its meaning
+      if(text.trimEnd().endsWith(time[0].trimEnd())){
+        text = text.slice(0, text.lastIndexOf(time[0]));
+      }
+    }
+  }
+
+  const day = /\s(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s/i.exec(text);
+  if(day){
+    const w = day[1].toLowerCase();
+    const d = parse(today());
+    if(w === 'tomorrow') d.setDate(d.getDate() + 1);
+    else if(w in WORD_DAY){
+      let delta = (WORD_DAY[w] - d.getDay() + 7) % 7;
+      if(delta === 0) delta = 7;
+      d.setDate(d.getDate() + delta);
+    }
+    out.due_date = iso(d);
+  }
+
+  const cleaned = text.replace(/\s+/g, ' ').trim().replace(/[,;]+$/, '');
+  if(cleaned) out.title = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+  return out;
+}
+
+const openTasks = () => S.tasks.filter(t => (t.status || 'open') === 'open');
+
+function taskBucket(t){
+  if(!t.due_date) return 'anytime';
+  const n = daysTo(t.due_date);
+  if(n < 0) return 'late';
+  if(n === 0) return 'today';
+  if(n <= 7) return 'week';
+  return 'later';
+}
+
+async function setTaskStatus(id, status){
+  const t = S.tasks.find(x => x.id === id);
+  if(!t) return;
+  await save('tasks', {...t, status, done_at: status === 'open' ? '' : new Date().toISOString()});
+  render();
+  toast(status === 'done' ? 'Done' : status === 'dropped' ? 'Dropped' : 'Back on the list');
+  sync({quiet:true});
+}
+
 /* ------------------------------------------------------------ shell */
 
 const $ = s => document.querySelector(s);
@@ -250,6 +324,7 @@ function render(){
   const el = $('#screen');
   if(subjectOpen) el.innerHTML = viewSubject(subjectOpen);
   else if(screen === 'today')  el.innerHTML = viewToday();
+  else if(screen === 'todo')   el.innerHTML = viewTasks();
   else if(screen === 'dates')  el.innerHTML = viewDates();
   else if(screen === 'money')  el.innerHTML = viewMoney();
   else if(screen === 'things') el.innerHTML = viewThings();
@@ -305,7 +380,7 @@ function viewToday(){
   const spent = S.payments.filter(p => String(p.paid_on).startsWith(m))
     .reduce((s,p) => s + (parseFloat(p.amount)||0), 0);
 
-  if(!S.obligations.length && !S.events.length){
+  if(!S.obligations.length && !S.events.length && !S.tasks.length){
     return `<div class="empty" style="padding-top:40px">
       <b>Nothing in here yet.</b>
       Tap + and say something like “car insurance renews 14 March, Admiral,
@@ -313,6 +388,14 @@ function viewToday(){
   }
 
   let h = '';
+
+  const jobs = openTasks().filter(t => ['late','today'].includes(taskBucket(t)));
+  if(jobs.length){
+    h += eyebrow('To do', jobs.length, 'now');
+    h += jobs.sort((a,b) => String(a.due_time||'zz').localeCompare(String(b.due_time||'zz')))
+      .map(t => taskRow(t)).join('');
+  }
+
   if(late.length) h += eyebrow('Overdue', late.length) +
     late.map(i => rowHTML(markOf(daysTo(i.date)), i.title, i.sub,
       i.amount ? money(+i.amount) : '', `data-open="${i.kind}:${i.id}"`)).join('');
@@ -386,6 +469,77 @@ function startOfWeek(anchor){
   const d = parse(anchor);
   d.setDate(d.getDate() - ((d.getDay() + 6) % 7));   // Monday first
   return iso(d);
+}
+
+function viewTasks(){
+  const open = openTasks();
+  const buckets = [
+    ['late',   'Overdue'],
+    ['today',  'Today'],
+    ['week',   'This week'],
+    ['later',  'Later'],
+    ['anytime','Whenever']
+  ];
+
+  let h = `<div class="quickadd">
+    <input id="qa" type="text" placeholder="What's on your mind?"
+           autocomplete="off" enterkeyhint="done">
+    <button class="btn primary" id="qaBtn">Add</button>
+  </div>
+  <p class="hint">Tap the microphone on your keyboard and just say it.
+    “Gym at 10”, “call the estate agent”, “pay the window cleaner friday”.</p>`;
+
+  if(!open.length){
+    h += `<div class="empty" style="padding-top:22px"><b>Nothing outstanding.</b>
+      Anything you add here stays until you tick it off or drop it.</div>`;
+  }
+
+  buckets.forEach(([key, label]) => {
+    const list = open.filter(t => taskBucket(t) === key)
+      .sort((a,b) => String(a.due_date + (a.due_time||'')).localeCompare(
+                     String(b.due_date + (b.due_time||''))));
+    if(!list.length) return;
+    h += eyebrow(label, list.length);
+    h += list.map(t => taskRow(t)).join('');
+  });
+
+  const finished = S.tasks.filter(t => (t.status || 'open') !== 'open')
+    .sort((a,b) => a.done_at < b.done_at ? 1 : -1).slice(0, 15);
+  if(finished.length){
+    h += eyebrow('Cleared', finished.length);
+    h += finished.map(t => `<div class="row done">
+      <span class="mark"><b>${t.status === 'done' ? '✓' : '✕'}</b>
+        <s>${t.status === 'done' ? 'done' : 'dropped'}</s></span>
+      <span class="body"><h3>${esc(t.title)}</h3>
+        <div class="meta">${t.done_at ? pretty(t.done_at.slice(0,10)) : ''}
+          <button class="linkbtn" data-task-open="${t.id}">put back</button></div>
+      </span></div>`).join('');
+  }
+  return h;
+}
+
+function taskRow(t){
+  const when = t.due_date
+    ? (daysTo(t.due_date) === 0 ? (t.due_time || 'today')
+       : t.due_time ? pretty(t.due_date) + ' · ' + t.due_time : pretty(t.due_date))
+    : '';
+  const late = t.due_date && daysTo(t.due_date) < 0;
+  const mark = t.due_date ? markOf(daysTo(t.due_date)) : {b:'·', s:'', cls:''};
+  return `<div class="row task${late ? ' late' : ''}">
+    <span class="mark ${mark.cls}"><b class="num">${esc(mark.b)}</b><s>${esc(mark.s)}</s></span>
+    <span class="body">
+      <button class="tasktitle" data-task="${t.id}">
+        <h3>${esc(t.title)}</h3>
+        ${when || t.subject_id ? `<div class="meta">${
+          [when, nameOf(t.subject_id), t.remind === 'yes' ? 'reminder set' : '']
+            .filter(Boolean).map(esc).join(' · ')}</div>` : ''}
+      </button>
+    </span>
+    <span class="taskacts">
+      <button class="tick" data-task-done="${t.id}" aria-label="Done">✓</button>
+      <button class="drop" data-task-drop="${t.id}" aria-label="Drop">✕</button>
+    </span>
+  </div>`;
 }
 
 function viewDates(){
@@ -654,6 +808,7 @@ function captureSheet(){
     </div>
     <div class="eyebrow">Or enter it yourself</div>
     <div class="btnrow">
+      <button class="btn" data-new="task">To do</button>
       <button class="btn" data-new="obligation">Date or payment</button>
       <button class="btn" data-new="event">One-off event</button>
       <button class="btn" data-new="activity">Weekly class</button>
@@ -668,7 +823,8 @@ function captureSheet(){
     const btn = $('#read'); btn.disabled = true; btn.textContent = 'Reading…';
     try{
       const out = await call('parse', { text, today: today() });
-      confirmParsed(out.parsed, text);
+      if(Array.isArray(out.parsed) && out.parsed.length > 1) confirmMany(out.parsed, text);
+      else confirmParsed(Array.isArray(out.parsed) ? out.parsed[0] : out.parsed, text);
     }catch(e){
       toast(e.message);
       btn.disabled = false; btn.textContent = 'Read it';
@@ -676,10 +832,72 @@ function captureSheet(){
   };
 }
 
+/* Several things said in one breath. Shown as a list to confirm in one tap,
+   rather than four forms in a row — refine any of them afterwards. */
+function confirmMany(items, original){
+  const rows = items.map((p, i) => {
+    const when = p.due_date || p.on_date || p.next_due || '';
+    const bits = [when ? pretty(when) : '', p.due_time || p.start_time || '',
+                  p.amount ? money(+p.amount) : '', p.type || 'task']
+      .filter(Boolean).join(' · ');
+    return `<label class="pickrow">
+      <input type="checkbox" class="pick" data-i="${i}" checked>
+      <span><b>${esc(p.title || 'Untitled')}</b><em>${esc(bits)}</em></span>
+    </label>`;
+  }).join('');
+
+  openSheet(`
+    <h2>I heard ${items.length} things</h2>
+    <p class="sub">Untick anything that shouldn't be saved. You can open each
+      one afterwards to add detail.</p>
+    <div id="picks">${rows}</div>
+    <div class="btnrow">
+      <button class="btn primary" id="saveAll">Save them</button>
+      <button class="btn ghost" data-close="1">Cancel</button>
+    </div>`);
+
+  $('#saveAll').onclick = async () => {
+    const chosen = [...document.querySelectorAll('.pick')]
+      .filter(c => c.checked).map(c => items[+c.dataset.i]);
+    for(const p of chosen) await saveParsed(p);
+    closeSheet(); render();
+    toast(chosen.length + ' saved');
+    sync({quiet:true});
+  };
+}
+
+/* Turn one parsed record into the right kind of row. */
+async function saveParsed(p){
+  const type = ['task','obligation','event','activity'].includes(p.type) ? p.type : 'task';
+  const common = { subject_id: guessSubject(p.subject_hint), note: p.note || '',
+                   review: p.review ? 'true' : '' };
+  if(type === 'task') return save('tasks', {...common, title: p.title || 'Untitled',
+    due_date: p.due_date || p.on_date || '', due_time: p.due_time || p.start_time || '',
+    remind: p.remind === 'yes' || p.due_time ? 'yes' : 'no',
+    calendar: 'household', status: 'open'});
+  if(type === 'event') return save('events', {...common, title: p.title || '',
+    on_date: p.on_date || p.due_date || '', start_time: p.start_time || p.due_time || '',
+    venue: p.venue || '', category: p.category || '', calendar: 'family'});
+  if(type === 'activity') return save('activities', {...common, title: p.title || '',
+    provider: p.provider || '', venue: p.venue || '',
+    day_of_week: p.day_of_week || '', start_time: p.start_time || ''});
+  return save('obligations', {...common, title: p.title || '', provider: p.provider || '',
+    category: p.category || '', amount: p.amount ?? '', cadence: p.cadence || 'yearly',
+    next_due: p.next_due || p.on_date || '', notice_days: p.notice_days ?? 14,
+    calendar: 'household', status: 'active'});
+}
+
 function confirmParsed(p, original){
-  const type = p.type === 'event' ? 'event' : p.type === 'activity' ? 'activity' : 'obligation';
+  const type = ['task','event','activity'].includes(p.type) ? p.type : 'obligation';
   const guess = { note: p.note || '', review: p.review ? 'true' : '', confidence: p.confidence || '' };
 
+  if(type === 'task') Object.assign(guess, {
+    title: p.title || '', due_date: p.due_date || p.on_date || '',
+    due_time: p.due_time || p.start_time || '',
+    remind: (p.remind === 'yes' || p.due_time) ? 'yes' : 'no',
+    calendar: 'household', status: 'open',
+    subject_id: guessSubject(p.subject_hint)
+  });
   if(type === 'obligation') Object.assign(guess, {
     title: p.title || '', provider: p.provider || '', category: p.category || '',
     amount: p.amount ?? '', cadence: p.cadence || 'yearly',
@@ -804,6 +1022,24 @@ const FORMS = {
         <div>${field('Term from', 'term_start', r.term_start, 'date')}</div>
         <div>${field('Term to', 'term_end', r.term_end, 'date')}</div>
       </div>
+      ${field('Note', 'note', r.note)}`
+  },
+  task: {
+    tab:'tasks', title:'To do',
+    sub:'Something on your mind. A date is optional.',
+    body: r => `
+      ${field('What is it', 'title', r.title)}
+      ${select('About', 'subject_id', r.subject_id, subjectOptions())}
+      <div class="grid2">
+        <div>${field('When', 'due_date', r.due_date, 'date')}</div>
+        <div>${field('Time', 'due_time', r.due_time, 'time')}</div>
+      </div>
+      ${select('Remind me', 'remind', r.remind || 'no',
+        [{v:'no',t:'No — just keep it on the list'},
+         {v:'yes',t:'Yes — put it on the calendar'}], false)}
+      ${select('Which calendar', 'calendar', r.calendar || 'household',
+        [{v:'household',t:'Household — just the two of you'},
+         {v:'family',t:'Family — everyone sees it'}], false)}
       ${field('Note', 'note', r.note)}`
   },
   subject: {
@@ -1053,8 +1289,14 @@ function settingsSheet(){
 /* ------------------------------------------------------------ events */
 
 document.addEventListener('click', async e => {
-  const t = e.target.closest('[data-close],[data-open],[data-subject],[data-back],[data-new],[data-settings],[data-doc],[data-tel],[data-datesview],[data-month],[data-week],[data-day]');
+  const t = e.target.closest('[data-close],[data-open],[data-subject],[data-back],[data-new],[data-settings],[data-doc],[data-tel],[data-datesview],[data-month],[data-week],[data-day],[data-task],[data-task-done],[data-task-drop],[data-task-open],#qaBtn');
   if(!t) return;
+
+  if(t.dataset.taskDone) return setTaskStatus(t.dataset.taskDone, 'done');
+  if(t.dataset.taskDrop) return setTaskStatus(t.dataset.taskDrop, 'dropped');
+  if(t.dataset.taskOpen) return setTaskStatus(t.dataset.taskOpen, 'open');
+  if(t.dataset.task) return formSheet('task', S.tasks.find(x => x.id === t.dataset.task) || {});
+  if(t.id === 'qaBtn') return quickAdd();
 
   if(t.dataset.datesview){ datesView = t.dataset.datesview; return render(); }
   if(t.dataset.month){ datesAnchor = shiftMonth(datesAnchor, +t.dataset.month);
@@ -1093,6 +1335,22 @@ document.addEventListener('click', async e => {
       if(d && d.drive_url) window.open(d.drive_url, '_blank');
     }
   }
+});
+
+async function quickAdd(){
+  const box = $('#qa');
+  if(!box || !box.value.trim()) return;
+  const t = quickParse(box.value);
+  box.value = '';
+  await save('tasks', {...t, status:'open', calendar:'household'});
+  render();
+  const added = $('#qa'); if(added) added.focus();
+  toast(t.due_time ? 'Added for ' + t.due_time : 'Added');
+  sync({quiet:true});
+}
+
+document.addEventListener('keydown', e => {
+  if(e.key === 'Enter' && e.target.id === 'qa'){ e.preventDefault(); quickAdd(); }
 });
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {

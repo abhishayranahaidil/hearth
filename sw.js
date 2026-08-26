@@ -2,7 +2,7 @@
    Network first for everything, cache as the fallback. The app must never
    serve you a stale copy of itself — that cost a day last time. */
 
-const CACHE = 'hearth-v0.3.0';
+const CACHE = 'hearth-v0.4.0';
 const SHELL = ['./', 'index.html', 'app.js', 'manifest.json'];
 
 self.addEventListener('install', e => {
