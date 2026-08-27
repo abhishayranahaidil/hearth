@@ -2,7 +2,7 @@
    Offline-first. The Sheet is the truth; the phone always holds a copy.
    Writes go to a queue on the phone and leave when there is signal. */
 
-const VERSION = '0.4.0';
+const VERSION = '0.6.0';
 const TABS = ['subjects','obligations','payments','activities','events',
               'documents','readings','contacts','tasks','vocab'];
 
@@ -21,9 +21,13 @@ const cfg = {
 /* ------------------------------------------------------------ storage */
 
 let db;
+/* Bump this whenever TABS gains an entry, or the new store is never created
+   on a phone that already has the app. */
+const DB_VERSION = 2;
+
 function openDB(){
   return new Promise((res, rej) => {
-    const r = indexedDB.open('hearth', 1);
+    const r = indexedDB.open('hearth', DB_VERSION);
     r.onupgradeneeded = () => {
       const d = r.result;
       TABS.forEach(t => { if(!d.objectStoreNames.contains(t)) d.createObjectStore(t,{keyPath:'id'}); });
@@ -43,7 +47,12 @@ async function putAll(store, rows){
   (rows||[]).forEach(r => { if(r && r.id) t.put(r); });
   return new Promise(res => t.transaction.oncomplete = res);
 }
-const getAll = store => done(tx(store).getAll());
+/* Reads tolerate a store that isn't there yet, so a future tab can never
+   brick the app the way the tasks tab did. */
+async function getAll(store){
+  try { return await done(tx(store).getAll()); }
+  catch(e){ console.warn('store not ready:', store); return []; }
+}
 const putOne = (store, row) => done(tx(store,'readwrite').put(row));
 const dropOne = (store, id) => done(tx(store,'readwrite').delete(id));
 
@@ -70,7 +79,7 @@ let queueLen = 0;
 
 async function loadLocal(){
   for(const t of TABS) S[t] = await getAll(t);
-  queueLen = await done(tx('queue').count());
+  try { queueLen = await done(tx('queue').count()); } catch(e){ queueLen = 0; }
 }
 
 async function sync({quiet = false} = {}){
@@ -190,6 +199,176 @@ const nameOf = id => (subjectOf(id) || {}).name || '';
 const vocabList = list => S.vocab.filter(v => v.list === list && v.active !== 'no')
   .sort((a,b) => (+a.sort||0) - (+b.sort||0)).map(v => v.value);
 
+/* ------------------------------------------------------------ scans */
+
+const MONTH_WORDS = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+
+/**
+ * Pull dates out of OCR text without needing the network. Handles UK order
+ * (03/04/2026 is 3 April) and written months. Returns future dates first,
+ * because in a letter those are almost always the deadline.
+ */
+function findDates(text){
+  const found = [];
+  const push = (y, m, d) => {
+    if(y < 100) y += 2000;
+    if(m < 0 || m > 11 || d < 1 || d > 31 || y < 2000 || y > 2100) return;
+    const dt = new Date(y, m, d);
+    if(dt.getMonth() === m && dt.getDate() === d) found.push(iso(dt));
+  };
+
+  const numeric = /\b(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{2,4})\b/g;
+  let m;
+  while((m = numeric.exec(text))) push(+m[3], +m[2] - 1, +m[1]);   // UK order
+
+  const written = /\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})\.?,?\s+(\d{4})\b/gi;
+  while((m = written.exec(text))){
+    const mon = MONTH_WORDS[m[2].slice(0,3).toLowerCase()];
+    if(mon !== undefined) push(+m[3], mon, +m[1]);
+  }
+  const reversed = /\b([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/gi;
+  while((m = reversed.exec(text))){
+    const mon = MONTH_WORDS[m[1].slice(0,3).toLowerCase()];
+    if(mon !== undefined) push(+m[3], mon, +m[2]);
+  }
+
+  const uniq = [...new Set(found)].sort();
+  const future = uniq.filter(d => daysTo(d) >= 0);
+  return {all: uniq, next: future[0] || '', earliest: uniq[0] || ''};
+}
+
+/** Photograph → Drive → OCR → something you can act on. */
+function snapSheet(seed = {}){
+  openSheet(`
+    <h2>Photograph it</h2>
+    <p class="sub">The picture goes to Drive, the words are read out of it, and
+      you get a to-do you can act on. Works for letters, bills, invitations,
+      appointment cards.</p>
+    <label for="snap">Photo or PDF</label>
+    <input id="snap" type="file" accept="image/*,application/pdf" capture="environment">
+    <div id="form">
+      ${select('What is it about', 'subject_id', seed.subject_id || '', subjectOptions())}
+      ${vocabSelect('Kind of document', 'category', seed.category || '', 'doc_category')}
+    </div>
+    <div class="btnrow">
+      <button class="btn primary" id="snapGo">Read it</button>
+      <button class="btn ghost" data-close="1">Cancel</button>
+    </div>`);
+
+  $('#snapGo').onclick = guard(async () => {
+    const f = $('#snap').files[0];
+    if(!f) return toast('Take a photo first.');
+    if(!navigator.onLine) return toast('Reading a photo needs signal. Try again when you have some.');
+
+    const btn = $('#snapGo');
+    btn.disabled = true; btn.textContent = 'Reading…';
+    try{
+      const data = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(String(r.result).split(',')[1]);
+        r.onerror = () => rej(new Error('Could not read that file.'));
+        r.readAsDataURL(f);
+      });
+      const {values} = readForm();
+      const up = await call('upload', {
+        ...values, name: f.name || ('scan-' + Date.now() + '.jpg'),
+        mime: f.type || 'image/jpeg', data,
+        title: 'Scan ' + pretty(today()), doc_date: today()
+      });
+      await sync({quiet:true});
+      afterScan(up.doc, values);
+    }finally{
+      const b = $('#snapGo');
+      if(b){ b.disabled = false; b.textContent = 'Read it'; }
+    }
+  });
+}
+
+/** What to offer once the picture is in Drive and the text is out of it. */
+async function afterScan(doc, seed){
+  const text = (doc && doc.ocr_text) || '';
+
+  if(!text.trim()){
+    toast('Saved to Drive, but no text could be read');
+    return formSheet('task', {...seed, document_id: doc.id,
+      title: '', note: 'From a scan with no readable text.'});
+  }
+
+  // with a key, let the model say what needs doing; without one, fall back
+  // to the dates in the text, which is most of the value anyway
+  try{
+    const out = await call('parse', { text: text.slice(0, 6000),
+                                      today: today(), mode: 'document' });
+    const items = Array.isArray(out.parsed) ? out.parsed : [out.parsed];
+    if(items.length && items[0] && items[0].title){
+      if(doc && items[0].doc_title){
+        await save('documents', {...doc, title: items[0].doc_title,
+          doc_date: items[0].doc_date || doc.doc_date,
+          expires_on: items[0].due_date || doc.expires_on});
+      }
+      return confirmScan(items, doc, seed);
+    }
+  }catch(e){
+    console.warn('document parsing unavailable:', e.message);
+  }
+
+  const dates = findDates(text);
+  const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 160);
+  formSheet('task', {
+    ...seed,
+    document_id: doc.id,
+    title: '',
+    due_date: dates.next,
+    note: snippet + (text.length > 160 ? '…' : '')
+  }, `<p class="sub">Saved to Drive and the text read.
+      ${dates.next ? 'The next date in it is <b>' + pretty(dates.next) + '</b> — '
+                   : 'No future date found in it — '}
+      say what you need to do about it.</p>`);
+}
+
+function confirmScan(items, doc, seed){
+  const rows = items.map((p, i) => `<label class="pickrow">
+      <input type="checkbox" class="pick" data-i="${i}" checked>
+      <span><b>${esc(p.title)}</b><em>${
+        [p.due_date ? 'by ' + pretty(p.due_date) : '', p.provider || '',
+         p.amount ? money(+p.amount) : '', p.review ? 'check this' : '']
+          .filter(Boolean).map(esc).join(' · ')}</em></span>
+    </label>`).join('');
+
+  openSheet(`
+    <h2>${items.length === 1 ? 'One thing to do' : items.length + ' things to do'}</h2>
+    <p class="sub">${esc(items[0].summary || 'Read from the photograph.')}
+      The document is saved and linked to each.</p>
+    <div id="picks">${rows}</div>
+    <div class="btnrow">
+      <button class="btn primary" id="saveScan">Add to my list</button>
+      <button class="btn" data-doc="${doc.id}">Open the scan</button>
+      <button class="btn ghost" data-close="1">Not now</button>
+    </div>`);
+
+  $('#saveScan').onclick = guard(async () => {
+    const chosen = [...document.querySelectorAll('.pick')]
+      .filter(c => c.checked).map(c => items[+c.dataset.i]);
+    for(const p of chosen){
+      if(p.type === 'obligation'){
+        await save('obligations', { title: p.title, provider: p.provider || '',
+          amount: p.amount ?? '', cadence: 'yearly', next_due: p.due_date || '',
+          notice_days: 30, calendar: 'household', status: 'active',
+          subject_id: seed.subject_id || '', account_ref: p.reference || '',
+          note: p.summary || '', review: 'true' });
+      } else {
+        await save('tasks', { title: p.title, due_date: p.due_date || '',
+          remind: p.due_date ? 'yes' : 'no', calendar: 'household',
+          status: 'open', document_id: doc.id,
+          subject_id: seed.subject_id || '', note: p.summary || '' });
+      }
+    }
+    closeSheet(); render();
+    toast(chosen.length + ' added');
+    sync({quiet:true});
+  });
+}
+
 /* ------------------------------------------------------------ tasks */
 
 const WORD_DAY = {sunday:0, monday:1, tuesday:2, wednesday:3,
@@ -270,7 +449,7 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-let screen = 'today';
+let screen = 'todo';
 let subjectOpen = null;
 let datesView = 'month';
 let datesAnchor = null;      // set on first render, once today() is available
@@ -283,6 +462,18 @@ function setStatus(kind, text){
 function updateBadge(){
   if(queueLen > 0) setStatus('busy', queueLen + ' waiting');
 }
+/* Wraps a click handler so anything thrown is shown rather than swallowed.
+   A button that does nothing is the worst possible failure. */
+function guard(fn){
+  return async (...args) => {
+    try { await fn(...args); }
+    catch(e){
+      console.error(e);
+      toast(e && e.message ? e.message : 'That did not work.');
+    }
+  };
+}
+
 let toastTimer;
 function toast(msg){
   const t = $('#toast');
@@ -323,7 +514,6 @@ function render(){
   if(!datesAnchor) datesAnchor = today();
   const el = $('#screen');
   if(subjectOpen) el.innerHTML = viewSubject(subjectOpen);
-  else if(screen === 'today')  el.innerHTML = viewToday();
   else if(screen === 'todo')   el.innerHTML = viewTasks();
   else if(screen === 'dates')  el.innerHTML = viewDates();
   else if(screen === 'money')  el.innerHTML = viewMoney();
@@ -367,59 +557,6 @@ function thisWeek(){
               DAYS.indexOf(String(b.day_of_week).toLowerCase());
     return d || String(a.start_time).localeCompare(String(b.start_time));
   });
-}
-
-function viewToday(){
-  const up = upcoming();
-  const late = up.filter(i => daysTo(i.date) < 0);
-  const soon = up.filter(i => { const d = daysTo(i.date); return d >= 0 && d <= 30; });
-  const week = thisWeek();
-
-  const committed = liveObligations().reduce((s,o) => s + monthly(o), 0);
-  const m = today().slice(0,7);
-  const spent = S.payments.filter(p => String(p.paid_on).startsWith(m))
-    .reduce((s,p) => s + (parseFloat(p.amount)||0), 0);
-
-  if(!S.obligations.length && !S.events.length && !S.tasks.length){
-    return `<div class="empty" style="padding-top:40px">
-      <b>Nothing in here yet.</b>
-      Tap + and say something like “car insurance renews 14 March, Admiral,
-      six hundred and twenty pounds, remind me a month before”.</div>`;
-  }
-
-  let h = '';
-
-  const jobs = openTasks().filter(t => ['late','today'].includes(taskBucket(t)));
-  if(jobs.length){
-    h += eyebrow('To do', jobs.length, 'now');
-    h += jobs.sort((a,b) => String(a.due_time||'zz').localeCompare(String(b.due_time||'zz')))
-      .map(t => taskRow(t)).join('');
-  }
-
-  if(late.length) h += eyebrow('Overdue', late.length) +
-    late.map(i => rowHTML(markOf(daysTo(i.date)), i.title, i.sub,
-      i.amount ? money(+i.amount) : '', `data-open="${i.kind}:${i.id}"`)).join('');
-
-  h += eyebrow('Next 30 days', soon.length);
-  h += soon.length
-    ? soon.map(i => rowHTML(markOf(daysTo(i.date)), i.title, i.sub,
-        i.amount ? money(+i.amount) : '', `data-open="${i.kind}:${i.id}"`)).join('')
-    : '<div class="empty">Clear month. Nothing falls due.</div>';
-
-  if(week.length){
-    h += eyebrow('Every week', week.length);
-    h += week.map(a => rowHTML(
-      {b: String(a.day_of_week).slice(0,3), s: a.start_time || '', cls:''},
-      a.title, [nameOf(a.subject_id), a.venue].filter(Boolean).join(' · '),
-      '', `data-open="activity:${a.id}"`)).join('');
-  }
-
-  h += eyebrow('Money', undefined, 'this month');
-  h += `<div class="card">
-    <div class="tot"><b class="num">${money(committed)}</b><span>committed each month</span></div>
-    <div class="meta" style="margin-top:8px">${money(spent)} paid so far in ${MON[new Date().getMonth()]}</div>
-  </div>`;
-  return h;
 }
 
 /* --- everything happening on one day, including the weekly classes --- */
@@ -485,6 +622,7 @@ function viewTasks(){
     <input id="qa" type="text" placeholder="What's on your mind?"
            autocomplete="off" enterkeyhint="done">
     <button class="btn primary" id="qaBtn">Add</button>
+    <button class="btn snap" id="snapBtn" aria-label="Photograph something">▣</button>
   </div>
   <p class="hint">Tap the microphone on your keyboard and just say it.
     “Gym at 10”, “call the estate agent”, “pay the window cleaner friday”.</p>`;
@@ -503,6 +641,8 @@ function viewTasks(){
     h += list.map(t => taskRow(t)).join('');
   });
 
+  h += comingUp();
+
   const finished = S.tasks.filter(t => (t.status || 'open') !== 'open')
     .sort((a,b) => a.done_at < b.done_at ? 1 : -1).slice(0, 15);
   if(finished.length){
@@ -514,6 +654,48 @@ function viewTasks(){
         <div class="meta">${t.done_at ? pretty(t.done_at.slice(0,10)) : ''}
           <button class="linkbtn" data-task-open="${t.id}">put back</button></div>
       </span></div>`).join('');
+  }
+  return h;
+}
+
+/* A short tail under the list: the things that would matter if you opened
+   the app and saw nothing else. Deliberately brief — Dates and Money hold
+   the full picture. */
+function comingUp(){
+  const up = upcoming();
+  const late = up.filter(i => daysTo(i.date) < 0);
+  const soon = up.filter(i => { const d = daysTo(i.date); return d >= 0 && d <= 7; });
+  const dow = DAYS[new Date().getDay()];
+  const classes = thisWeek().filter(a => String(a.day_of_week).toLowerCase() === dow);
+
+  let h = '';
+
+  if(late.length){
+    h += eyebrow('Overdue', late.length);
+    h += late.slice(0,5).map(i => rowHTML(markOf(daysTo(i.date)), i.title, i.sub,
+      i.amount ? money(+i.amount) : '', `data-open="${i.kind}:${i.id}"`)).join('');
+  }
+
+  if(classes.length){
+    h += eyebrow('Today', classes.length);
+    h += classes.map(a => rowHTML({b: a.start_time || '·', s: '', cls:''},
+      a.title, [nameOf(a.subject_id), a.venue].filter(Boolean).join(' · '),
+      '', `data-open="activity:${a.id}"`)).join('');
+  }
+
+  if(soon.length){
+    h += eyebrow('Next 7 days', soon.length);
+    h += soon.slice(0,6).map(i => rowHTML(markOf(daysTo(i.date)), i.title, i.sub,
+      i.amount ? money(+i.amount) : '', `data-open="${i.kind}:${i.id}"`)).join('');
+  }
+
+  const committed = liveObligations().reduce((s,o) => s + monthly(o), 0);
+  if(committed){
+    const m = today().slice(0,7);
+    const paid = S.payments.filter(p => String(p.paid_on).startsWith(m))
+      .reduce((s,p) => s + (parseFloat(p.amount)||0), 0);
+    h += `<p class="tail">${money(committed)} committed a month ·
+      ${money(paid)} paid so far in ${MON[new Date().getMonth()]}</p>`;
   }
   return h;
 }
@@ -771,7 +953,7 @@ function viewSubject(id){
       [c.relation, c.phone].filter(Boolean).join(' · '), '', `data-tel="${esc(c.phone)}"`)).join('');
   }
   h += `<div class="btnrow"><button class="btn" data-new="obligation" data-subject-id="${id}">Add a date or payment</button>
-        <button class="btn" data-new="document" data-subject-id="${id}">Photograph a letter</button></div>`;
+        <button class="btn" data-new="snap" data-subject-id="${id}">Photograph a letter</button></div>`;
   return h;
 }
 
@@ -784,7 +966,7 @@ function renderSetup(){
   <label for="tk">Your token</label>
   <input id="tk" type="password" autocomplete="off" placeholder="the long string from Script Properties">
   <div class="btnrow"><button class="btn primary" id="connect">Connect</button></div>`;
-  $('#connect').onclick = async () => {
+  $('#connect').onclick = guard(async () => {
     cfg.endpoint = $('#ep').value; cfg.token = $('#tk').value;
     try{
       const out = await call('ping');
@@ -792,7 +974,7 @@ function renderSetup(){
       toast('Connected as ' + out.who);
       await sync();
     }catch(e){ toast(e.message); }
-  };
+  });
 }
 
 /* ------------------------------------------------------------ capture */
@@ -812,12 +994,12 @@ function captureSheet(){
       <button class="btn" data-new="obligation">Date or payment</button>
       <button class="btn" data-new="event">One-off event</button>
       <button class="btn" data-new="activity">Weekly class</button>
-      <button class="btn" data-new="document">Photograph</button>
+      <button class="btn" data-new="snap">Photograph</button>
       <button class="btn" data-new="reading">Record a result</button>
       <button class="btn" data-new="contact">Contact</button>
     </div>`);
   setTimeout(() => $('#say').focus(), 120);
-  $('#read').onclick = async () => {
+  $('#read').onclick = guard(async () => {
     const text = $('#say').value.trim();
     if(!text) return toast('Say or type something first.');
     const btn = $('#read'); btn.disabled = true; btn.textContent = 'Reading…';
@@ -829,7 +1011,7 @@ function captureSheet(){
       toast(e.message);
       btn.disabled = false; btn.textContent = 'Read it';
     }
-  };
+  });
 }
 
 /* Several things said in one breath. Shown as a list to confirm in one tap,
@@ -856,14 +1038,14 @@ function confirmMany(items, original){
       <button class="btn ghost" data-close="1">Cancel</button>
     </div>`);
 
-  $('#saveAll').onclick = async () => {
+  $('#saveAll').onclick = guard(async () => {
     const chosen = [...document.querySelectorAll('.pick')]
       .filter(c => c.checked).map(c => items[+c.dataset.i]);
     for(const p of chosen) await saveParsed(p);
     closeSheet(); render();
     toast(chosen.length + ' saved');
     sync({quiet:true});
-  };
+  });
 }
 
 /* Turn one parsed record into the right kind of row. */
@@ -1034,6 +1216,8 @@ const FORMS = {
         <div>${field('When', 'due_date', r.due_date, 'date')}</div>
         <div>${field('Time', 'due_time', r.due_time, 'time')}</div>
       </div>
+      ${r.document_id ? `<label>Scan</label>
+        <button class="btn" data-doc="${r.document_id}" type="button">Open the photograph</button>` : ''}
       ${select('Remind me', 'remind', r.remind || 'no',
         [{v:'no',t:'No — just keep it on the list'},
          {v:'yes',t:'Yes — put it on the calendar'}], false)}
@@ -1118,7 +1302,7 @@ function formSheet(type, row = {}, intro = ''){
       <button class="btn ghost" data-close="1">Cancel</button>
     </div>`);
 
-  $('#saveBtn').onclick = async () => {
+  $('#saveBtn').onclick = guard(async () => {
     const {values, fresh} = readForm();
     const out = {...row, ...values};
     if(!out.title && !out.name && !out.label) return toast('Give it a name at least.');
@@ -1127,11 +1311,11 @@ function formSheet(type, row = {}, intro = ''){
     closeSheet(); render();
     toast(navigator.onLine ? 'Saved' : 'Saved on the phone — will sync');
     sync({quiet:true});
-  };
-  if(row.id) $('#delBtn').onclick = async () => {
+  });
+  if(row.id) $('#delBtn').onclick = guard(async () => {
     await remove(f.tab, row.id);
     closeSheet(); render(); toast('Deleted');
-  };
+  });
 }
 
 /* reveal the "name it" box when a dropdown is set to add a new value */
@@ -1199,7 +1383,7 @@ function markPaidSheet(o){
       <button class="btn primary" id="confirm">Mark paid</button>
       <button class="btn ghost" data-close="1">Cancel</button>
     </div>`);
-  $('#confirm').onclick = async () => {
+  $('#confirm').onclick = guard(async () => {
     const {values: v, fresh} = readForm();
     await saveNewVocab(fresh);
     // optimistic: write the payment locally and advance the date on the phone too
@@ -1209,7 +1393,7 @@ function markPaidSheet(o){
     await enqueue('markPaid', { obligation_id:o.id, ...v });
     closeSheet(); render();
     toast('Marked paid'); sync({quiet:true});
-  };
+  });
 }
 
 /* --- documents --- */
@@ -1235,7 +1419,7 @@ function documentSheet(subjectId = ''){
       <button class="btn ghost" data-close="1">Cancel</button>
     </div>`);
 
-  $('#up').onclick = async () => {
+  $('#up').onclick = guard(async () => {
     const f = $('#file').files[0];
     if(!f) return toast('Choose a photo first.');
     if(!navigator.onLine) return toast('Uploads need signal. Try again when you have some.');
@@ -1254,7 +1438,7 @@ function documentSheet(subjectId = ''){
     }catch(e){
       toast(e.message); btn.disabled = false; btn.textContent = 'Upload';
     }
-  };
+  });
 }
 
 function settingsSheet(){
@@ -1279,17 +1463,17 @@ function settingsSheet(){
     closeSheet(); sync();
   };
   $('#s_sync').onclick = () => { closeSheet(); sync(); };
-  $('#s_out').onclick = async () => {
+  $('#s_out').onclick = guard(async () => {
     localStorage.clear();
     for(const t of TABS) await putAll(t, []);
     closeSheet(); location.reload();
-  };
+  });
 }
 
 /* ------------------------------------------------------------ events */
 
-document.addEventListener('click', async e => {
-  const t = e.target.closest('[data-close],[data-open],[data-subject],[data-back],[data-new],[data-settings],[data-doc],[data-tel],[data-datesview],[data-month],[data-week],[data-day],[data-task],[data-task-done],[data-task-drop],[data-task-open],#qaBtn');
+document.addEventListener('click', guard(async e => {
+  const t = e.target.closest('[data-close],[data-open],[data-subject],[data-back],[data-new],[data-settings],[data-doc],[data-tel],[data-datesview],[data-month],[data-week],[data-day],[data-task],[data-task-done],[data-task-drop],[data-task-open],#qaBtn,#snapBtn');
   if(!t) return;
 
   if(t.dataset.taskDone) return setTaskStatus(t.dataset.taskDone, 'done');
@@ -1297,6 +1481,7 @@ document.addEventListener('click', async e => {
   if(t.dataset.taskOpen) return setTaskStatus(t.dataset.taskOpen, 'open');
   if(t.dataset.task) return formSheet('task', S.tasks.find(x => x.id === t.dataset.task) || {});
   if(t.id === 'qaBtn') return quickAdd();
+  if(t.id === 'snapBtn') return snapSheet();
 
   if(t.dataset.datesview){ datesView = t.dataset.datesview; return render(); }
   if(t.dataset.month){ datesAnchor = shiftMonth(datesAnchor, +t.dataset.month);
@@ -1321,6 +1506,7 @@ document.addEventListener('click', async e => {
   if(t.dataset.new){
     const kind = t.dataset.new;
     const seed = t.dataset.subjectId ? {subject_id: t.dataset.subjectId} : {};
+    if(kind === 'snap') return snapSheet(t.dataset.subjectId ? {subject_id:t.dataset.subjectId} : {});
     if(kind === 'document') return documentSheet(t.dataset.subjectId || '');
     return formSheet(kind, seed);
   }
@@ -1335,9 +1521,9 @@ document.addEventListener('click', async e => {
       if(d && d.drive_url) window.open(d.drive_url, '_blank');
     }
   }
-});
+}));
 
-async function quickAdd(){
+const quickAdd = guard(async function(){
   const box = $('#qa');
   if(!box || !box.value.trim()) return;
   const t = quickParse(box.value);
@@ -1347,7 +1533,7 @@ async function quickAdd(){
   const added = $('#qa'); if(added) added.focus();
   toast(t.due_time ? 'Added for ' + t.due_time : 'Added');
   sync({quiet:true});
-}
+});
 
 document.addEventListener('keydown', e => {
   if(e.key === 'Enter' && e.target.id === 'qa'){ e.preventDefault(); quickAdd(); }
@@ -1380,11 +1566,28 @@ document.addEventListener('visibilitychange', () => {
 /* ------------------------------------------------------------ start */
 
 (async function start(){
-  db = await openDB();
-  await loadLocal();
-  render();
-  if(cfg.ready){ setStatus('busy','Syncing'); sync({quiet:true}); }
+  try{
+    db = await openDB();
+    await loadLocal();
+    render();
+    if(cfg.ready){ setStatus('busy','Syncing'); sync({quiet:true}); }
+    else setStatus('off','Not set up');
+  }catch(e){
+    console.error(e);
+    document.querySelector('#screen').innerHTML =
+      `<div class="empty" style="padding-top:34px"><b>The app could not start.</b>
+        ${esc(e && e.message ? e.message : String(e))}
+        <div class="btnrow"><button class="btn" onclick="location.reload()">Try again</button></div>
+      </div>`;
+    setStatus('err','Failed to start');
+  }
   if('serviceWorker' in navigator){
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 })();
+
+/* last resort: anything unhandled still gets seen */
+window.addEventListener('unhandledrejection', e => {
+  console.error(e.reason);
+  toast(e.reason && e.reason.message ? e.reason.message : 'Something went wrong.');
+});
